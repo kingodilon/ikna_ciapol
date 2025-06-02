@@ -1,0 +1,329 @@
+# ===============================================================================
+# Docker Compose CIAPOL - Services Essentiels
+# Architecture simplifiée : StarRocks + Pulsar + SeaTunnel + DolphinScheduler + Frontend
+# ===============================================================================
+
+services:
+  # =============================================================================
+  # STARROCKS - Base de données principale
+  # =============================================================================
+  starrocks:
+    build: ./services/starrocks
+    container_name: ciapol-starrocks
+    ports:
+      - "8030:8030"  # HTTP interface (Web UI)
+      - "9020:9020"  # BE heartbeat port
+      - "9030:9030"  # MySQL protocol port
+      - "8040:8040"  # BE HTTP port
+    environment:
+      - STARROCKS_FE_HOST=0.0.0.0
+      - STARROCKS_BE_HOST=0.0.0.0
+      - MYSQL_ROOT_PASSWORD=
+      - WAIT_FOR_DEPENDENCIES=false
+    volumes:
+      - starrocks_data:/opt/starrocks/fe/meta
+      - starrocks_be_data:/opt/starrocks/be/storage
+    networks:
+      - ciapol-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8030/api/bootstrap"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # =============================================================================
+  # PULSAR - Messagerie temps réel
+  # =============================================================================
+  pulsar:
+    image: apachepulsar/pulsar:latest
+    container_name: ciapol-pulsar
+    ports:
+      - "6650:6650"  # Pulsar protocol
+      - "8080:8080"  # Web service API
+      - "3002:8080"  # Web UI (alias)
+    environment:
+      - PULSAR_MEM=-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m
+    volumes:
+      - pulsar_data:/pulsar/data
+      - pulsar_conf:/pulsar/conf
+    networks:
+      - ciapol-network
+    restart: unless-stopped
+    command: >
+      sh -c "
+      bin/pulsar standalone --advertised-address pulsar
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/admin/v2/clusters"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # =============================================================================
+  # SEATUNNEL - ETL avec Zeta Engine Cluster
+  # =============================================================================
+  seatunnel:
+    image: flink:1.18-java11
+    container_name: ciapol-seatunnel-zeta
+    ports:
+      - "5801:8081"  # Flink Web UI
+      - "5802:8082"  # REST API
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=seatunnel
+    volumes:
+      - seatunnel_conf:/opt/flink/conf
+      - seatunnel_logs:/opt/flink/log
+    networks:
+      - ciapol-network
+    restart: unless-stopped
+    depends_on:
+      - pulsar
+      - starrocks
+    command: >
+      sh -c "
+      echo 'rest.port: 8081' >> /opt/flink/conf/flink-conf.yaml &&
+      echo 'jobmanager.rpc.address: seatunnel' >> /opt/flink/conf/flink-conf.yaml &&
+      /opt/flink/bin/standalone-session.sh start &&
+      tail -f /dev/null
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # =============================================================================
+  # POSTGRESQL - Métadonnées DolphinScheduler uniquement
+  # =============================================================================
+  postgres:
+    image: postgres:15
+    container_name: ciapol-postgres-metadata-only
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=dolphinscheduler_meta
+      - POSTGRES_PASSWORD=dolphinscheduler_meta_2024
+      - POSTGRES_DB=dolphinscheduler_meta
+    volumes:
+      - postgres_metadata_only:/var/lib/postgresql/data
+    networks:
+      - ciapol-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dolphinscheduler_meta -d dolphinscheduler_meta"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # =============================================================================
+  # DOLPHINSCHEDULER - Orchestration des workflows
+  # =============================================================================
+  dolphinscheduler:
+    image: apache/airflow:2.8.0-python3.11
+    container_name: ciapol-dolphinscheduler
+    ports:
+      - "12345:8080"  # Web UI
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://dolphinscheduler_meta:dolphinscheduler_meta_2024@postgres/dolphinscheduler_meta
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW_UID=50000
+    volumes:
+      - dolphinscheduler_logs:/opt/airflow/logs
+      - dolphinscheduler_conf:/opt/airflow/dags
+    networks:
+      - ciapol-network
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - starrocks
+    command: >
+      sh -c "
+      airflow db init &&
+      airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin &&
+      airflow webserver
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # =============================================================================
+  # GENIE ML MODELS - Service pour appliquer les modèles ML
+  # =============================================================================
+  genie-ml-models:
+    build:
+      context: ./services/genie-ml-models
+      dockerfile: Dockerfile
+    container_name: ciapol-genie-ml-models
+    ports:
+      - "8005:8005"
+    environment:
+      - MODEL_PATH=/app/models
+    volumes:
+      - ml_models:/app/models
+      - genie_ml_logs:/app/logs
+    networks:
+      - ciapol-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # =============================================================================
+  # GENIE DATA API - Service pour les données moyennées (5 minutes)
+  # =============================================================================
+  genie-data-api:
+    build:
+      context: ./services/genie-data-api
+      dockerfile: Dockerfile
+    container_name: ciapol-genie-data-api
+    ports:
+      - "8006:8006"
+    environment:
+      - STARROCKS_HOST=starrocks
+      - STARROCKS_PORT=9030
+      - STARROCKS_USER=root
+      - STARROCKS_PASSWORD=
+      - STARROCKS_DATABASE=ciapol_analytics
+    volumes:
+      - genie_data_logs:/app/logs
+    networks:
+      - ciapol-network
+    restart: unless-stopped
+    depends_on:
+      - starrocks
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # =============================================================================
+  # GENIE PREDICTIONS API - Service pour les valeurs prédites
+  # =============================================================================
+  genie-predictions-api:
+    build:
+      context: ./services/genie-predictions-api
+      dockerfile: Dockerfile
+    container_name: ciapol-genie-predictions-api
+    ports:
+      - "8007:8007"
+    environment:
+      - STARROCKS_HOST=starrocks
+      - STARROCKS_PORT=9030
+      - STARROCKS_USER=root
+      - STARROCKS_PASSWORD=
+      - STARROCKS_DATABASE=ciapol_analytics
+      - GENIE_ML_MODELS_URL=http://genie-ml-models:8005
+      - GENIE_DATA_API_URL=http://genie-data-api:8006
+    volumes:
+      - genie_predictions_logs:/app/logs
+    networks:
+      - ciapol-network
+    restart: unless-stopped
+    depends_on:
+      - starrocks
+      - genie-ml-models
+      - genie-data-api
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # =============================================================================
+  # FRONTEND - Interface utilisateur
+  # =============================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ciapol-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_STARROCKS_URL=http://localhost:8030
+      - NEXT_PUBLIC_PULSAR_URL=http://localhost:8080
+      - NEXT_PUBLIC_SEATUNNEL_URL=http://localhost:5801
+      - NEXT_PUBLIC_DOLPHINSCHEDULER_URL=http://localhost:12345
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
+      - NEXT_TELEMETRY_DISABLED=1
+    networks:
+      - ciapol-network
+    restart: unless-stopped
+    depends_on:
+      - starrocks
+      - pulsar
+      - seatunnel
+      - dolphinscheduler
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+# =============================================================================
+# VOLUMES - Stockage persistant des services essentiels
+# =============================================================================
+volumes:
+  # StarRocks
+  starrocks_data:
+    driver: local
+  starrocks_be_data:
+    driver: local
+  
+  # Pulsar
+  pulsar_data:
+    driver: local
+  pulsar_conf:
+    driver: local
+  
+  # SeaTunnel
+  seatunnel_conf:
+    driver: local
+  seatunnel_logs:
+    driver: local
+  
+  # DolphinScheduler
+  dolphinscheduler_logs:
+    driver: local
+  dolphinscheduler_conf:
+    driver: local
+  postgres_metadata_only:
+    driver: local
+  
+  # Genie ML Services
+  ml_models:
+    driver: local
+  genie_ml_logs:
+    driver: local
+  genie_data_logs:
+    driver: local
+  genie_predictions_logs:
+    driver: local
+
+# =============================================================================
+# RÉSEAU
+# =============================================================================
+networks:
+  ciapol-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
